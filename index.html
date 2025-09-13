@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
   <title>AI/ML Quiz — Offline (Procedural)</title>
 
-  <!-- UI libs (static only) -->
+  <!-- Static UI libs -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -131,7 +131,22 @@
     </div>
   </div>
 
+  <!-- Toasts -->
   <div id="toastHost" class="fixed top-4 right-4 space-y-2 z-50"></div>
+
+  <!-- Promotion/Demotion Modal -->
+  <div id="modal" class="fixed inset-0 z-[60] hidden items-center justify-center bg-black/50">
+    <div class="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl w-[min(92vw,560px)] p-5">
+      <div class="flex items-center justify-between mb-2">
+        <h3 id="modalTitle" class="text-lg font-semibold">Notice</h3>
+        <button id="modalClose" class="btn"><i data-lucide="x"></i></button>
+      </div>
+      <div id="modalBody" class="text-sm leading-6"></div>
+      <div class="mt-4 text-right">
+        <button id="modalOk" class="btn btn-primary">OK</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Optional compressed bank slot (overrides default BANK if present) -->
   <!-- <script type="application/json" id="bank-lz">BASE64_FROM_LZSTRING_HERE</script> -->
@@ -513,6 +528,26 @@
   function incCounter(t,l,c){ ensureTL(state.counters,t,l,{correct:0,total:0}); state.counters[t][l].total++; if(c) state.counters[t][l].correct++; }
   function accuracy(t,l){ const c=state.counters[t]?.[l]||{correct:0,total:0}; return c.total?c.correct/c.total:0; }
 
+  // ---------- Modal helpers ----------
+  function openModal(title, html) {
+    const modal = document.getElementById("modal");
+    document.getElementById("modalTitle").textContent = title;
+    document.getElementById("modalBody").innerHTML = html;
+    modal.classList.remove("hidden");
+    modal.classList.add("flex");
+    if (window.lucide?.createIcons) window.lucide.createIcons();
+  }
+  function closeModal() {
+    const modal = document.getElementById("modal");
+    modal.classList.add("hidden");
+    modal.classList.remove("flex");
+  }
+  document.getElementById("modalClose").onclick = closeModal;
+  document.getElementById("modalOk").onclick = closeModal;
+  document.getElementById("modal").addEventListener("click", (e) => {
+    if (e.target.id === "modal") closeModal();
+  });
+
   // ---------- Templates ----------
   function sampleK(arr, k, pred = () => true) {
     const pool = arr.filter(pred);
@@ -542,15 +577,17 @@
       redis: "cache hot data in memory",
       warehouse: "analyze at warehouse scale"
     };
-    const bits = tags.map(t => map[t]).filter(Boolean).slice(0,3);
-    if (!bits.length) return `Which option best fits the described need?`;
+    const bits = (tags || []).map(t => map[t]).filter(Boolean).slice(0,3);
+    if (!bits.length) return null;             // only create scenario when we can articulate the need
     return `You need to ${bits.join(", ")}. Which option fits best?`;
   }
 
+  // ---------- Question builder ----------
   function makeQuestion(topic, level){
     const pool = bank[topic][level];
     if (!pool || pool.length===0) return null;
 
+    // avoid immediate repeats
     const key = `${topic}|${level}`;
     const recent = state.recentIds[key] || [];
     const candidates = pool.filter(q => !recent.includes(q.id));
@@ -579,11 +616,23 @@
     }
     else if (style === "scenario") {
       const tags = (target.meta?.tags || []).slice(0,3);
-      const distract = sampleK(others, 3, d => !hasAllTags(d, tags));
-      stem = `(${topic} / ${level}) ${scenarioFromTags(target.term, tags)}`;
-      choices = shuffle([target.term, ...distract.map(d=>d.term)]);
-      answerIndex = choices.indexOf(target.term);
-      explanation = `Why ${target.term}? ${target.desc}`;
+      const text = scenarioFromTags(target.term, tags);
+
+      if (!text) {
+        // Fallback to clear definition-style question
+        const distract = sampleK(others, 3);
+        stem = `(${topic} / ${level}) What does "${target.term}" most closely mean?`;
+        choices = shuffle([target.desc, ...distract.map(d=>d.desc)]);
+        answerIndex = choices.indexOf(target.desc);
+        explanation = `Correct: ${target.term} — ${target.desc}`;
+      } else {
+        // Scenario with clear need
+        const distract = sampleK(others, 3, d => !hasAllTags(d, tags));
+        stem = `(${topic} / ${level}) ${text}`;
+        choices = shuffle([target.term, ...distract.map(d=>d.term)]);
+        answerIndex = choices.indexOf(target.term);
+        explanation = `Why ${target.term}? ${target.desc}`;
+      }
     }
     else if (style === "truefalse") {
       const good = `${target.term} — ${target.desc}`;
@@ -602,14 +651,16 @@
       explanation = `The mismatched statement pairs ${target.term} with the wrong description.`;
     }
 
+    // track recently asked
     recent.unshift(target.id); state.recentIds[key] = recent.slice(0,18);
+
     return { id: target.id + "|" + style, topic, level, stem, choices, answerIndex, explanation };
   }
 
   function shuffle(a){ const x=[...a]; for(let i=x.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [x[i],x[j]]=[x[j],x[i]]; } return x; }
 
   // ---------- UI ----------
-  const charts = { topic: null, matrix: null };
+  const charts = { topic: null, matrix: null }; // avoid ID collisions
   let currentQ = null;
 
   function renderTopics(){
@@ -660,39 +711,52 @@
     else { setStreak(currentQ.topic,currentQ.level,0); }
     promoteOrDemote(currentQ.topic,currentQ.level,correct);
 
+    // UI feedback
     $all("#choices button").forEach((b,i)=>{
       b.disabled=true;
       if(i===currentQ.answerIndex) b.classList.add("bg-green-600","text-white","border-green-600");
       if(i===idx && !correct) b.classList.add("bg-red-600","text-white","border-red-600");
     });
 
+    // history + save + reports
     state.history.unshift({topic:currentQ.topic, level:currentQ.level, correct, qid:currentQ.id, ts:Date.now()});
     state.history=state.history.slice(0,500);
     saveState();
     refreshReports();
-    renderTopics();
-    updateContext();
+    renderTopics();              // refresh sidebar %
+    updateContext();             // refresh streak & badges
 
+    // explanation
     $("#btnExplain").disabled=false;
     $("#explanationBox").classList.remove("hidden");
     $("#explanationText").textContent=currentQ.explanation;
   }
+
+  // Promotions/Demotions: modal + toasts for streaks
   function promoteOrDemote(topic, level, correct){
     const idx=LEVELS.indexOf(level);
     if(correct){
       const s=getStreak(topic,level);
       if(MOTIVATION_STREAKS.includes(s)){
-        toast(`<div class="font-semibold">Nice streak</div><div class="text-sm">You hit ${s} in ${topic} (${level}).</div>`,"success");
+        toast(`<div class="font-semibold">Streak ${s}</div><div class="text-sm">${topic} (${level}) — keep going!</div>`,"success");
       }
       if(s>=PROMOTION_STREAK && idx<LEVELS.length-1){
         state.currentLevel=LEVELS[idx+1];
-        toast(`<div class="font-semibold">Promoted to ${state.currentLevel}</div><div class="text-sm">Harder questions unlocked in ${topic}.</div>`,"success");
         setStreak(topic,state.currentLevel,0);
+        openModal(
+          `Promoted to ${state.currentLevel}`,
+          `<p>You’re moving up in <b>${topic}</b> — expect tougher questions.</p>
+           <p class="mt-2 text-sm text-zinc-500">Tip: use explanations to cement concepts after each miss.</p>`
+        );
       }
     } else {
       if(idx>0){
         state.currentLevel=LEVELS[idx-1];
-        toast(`<div class="font-semibold">Demoted to ${state.currentLevel}</div><div class="text-sm">Reinforce ${topic} fundamentals and climb back.</div>`,"warn");
+        openModal(
+          `Reinforcement: ${state.currentLevel}`,
+          `<p>Dropping back in <b>${topic}</b> to reinforce fundamentals.</p>
+           <p class="mt-2 text-sm text-zinc-500">Review the explanation and reclaim your streak — you’ve got this.</p>`
+        );
       }
     }
   }
@@ -705,6 +769,7 @@
       return total?(correct/total*100):0;
     });
 
+    // Table
     const tbody=$("#reportTable"); tbody.innerHTML="";
     for(const t of TOPICS){
       const row=document.createElement("tr");
@@ -724,6 +789,7 @@
       tbody.appendChild(row);
     }
 
+    // Charts (use dedicated vars)
     const canvasTopic=document.getElementById("chartTopic");
     if (charts.topic && typeof charts.topic.destroy==="function") charts.topic.destroy();
     charts.topic=new Chart(canvasTopic,{type:"bar",data:{labels:TOPICS,datasets:[{label:"Accuracy %",data:topicAcc}]},options:{responsive:true,scales:{y:{suggestedMin:0,suggestedMax:100}}}});
